@@ -15,18 +15,28 @@ struct Base44XcodeBridgeApp: App {
 
 final class AppViewModel: ObservableObject {
     @Published var baseURLText = "https://api.base44.example"
-    @Published var tokenText = "YOUR_BASE44_TOKEN"
+    @Published var tokenText = ""
     @Published var projects: [Base44Project] = []
     @Published var statusMessage = "Ready"
     @Published var isLoading = false
+    @Published var schemeText = ""
 
-    private let client: Base44Client
     private let projectManager: XcodeProjectManager
+    private let keychain = KeychainHelper()
+
+    // last opened project (.xcodeproj or .xcworkspace)
+    private(set) var lastOpenedProjectURL: URL?
 
     init() {
-        let defaultURL = URL(string: "https://api.base44.example")!
-        self.client = Base44Client(baseURL: defaultURL, token: "YOUR_BASE44_TOKEN")
         self.projectManager = XcodeProjectManager()
+        // try load token from keychain
+        if let saved = keychain.readToken() {
+            self.tokenText = saved
+        }
+    }
+
+    func saveTokenToKeychain() {
+        keychain.saveToken(tokenText)
     }
 
     func loadProjects() {
@@ -36,8 +46,8 @@ final class AppViewModel: ObservableObject {
         isLoading = true
         statusMessage = "Loading projects..."
 
-        let updatedClient = Base44Client(baseURL: baseURL, token: token)
-        updatedClient.fetchProjects { [weak self] result in
+        let client = Base44Client(baseURL: baseURL, token: token)
+        client.fetchProjects { [weak self] result in
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.isLoading = false
@@ -71,6 +81,7 @@ final class AppViewModel: ObservableObject {
                 case .success(let archiveURL):
                     do {
                         let openedProjectURL = try self.projectManager.extractProjectArchive(at: archiveURL)
+                        self.lastOpenedProjectURL = openedProjectURL
                         let opened = self.projectManager.openInXcode(projectURL: openedProjectURL)
                         self.statusMessage = opened
                             ? "Opened \(project.name) in Xcode"
@@ -84,34 +95,75 @@ final class AppViewModel: ObservableObject {
             }
         }
     }
+
+    func buildLastOpenedProject() {
+        guard let projectURL = lastOpenedProjectURL else {
+            statusMessage = "No opened project to build"
+            return
+        }
+        let scheme = schemeText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !scheme.isEmpty else {
+            statusMessage = "Please enter the scheme name to build"
+            return
+        }
+
+        isLoading = true
+        statusMessage = "Building scheme \(scheme) on simulator..."
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                let output = try self.projectManager.buildForSimulator(projectURL: projectURL, scheme: scheme)
+                DispatchQueue.main.async {
+                    self.isLoading = false
+                    self.statusMessage = "Build succeeded for \(scheme). Output:\n\(output.prefix(200))..."
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.isLoading = false
+                    self.statusMessage = "Build failed: \(error.localizedDescription)"
+                }
+            }
+        }
+    }
 }
 
 struct ContentView: View {
     @ObservedObject var viewModel: AppViewModel
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 20) {
+        VStack(alignment: .leading, spacing: 16) {
             Text("Base44 Xcode Bridge")
-                .font(.system(size: 34, weight: .bold))
+                .font(.system(size: 32, weight: .bold))
 
             Group {
                 TextField("Base44 URL", text: $viewModel.baseURLText)
                     .textFieldStyle(.roundedBorder)
-                SecureField("Base44 token", text: $viewModel.tokenText)
-                    .textFieldStyle(.roundedBorder)
+                    .frame(maxWidth: 600)
+
+                HStack {
+                    SecureField("Base44 token", text: $viewModel.tokenText)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(maxWidth: 400)
+                    Button("Save token") {
+                        viewModel.saveTokenToKeychain()
+                    }
+                    .buttonStyle(.bordered)
+                }
             }
 
-            HStack {
+            HStack(spacing: 12) {
                 Button(action: viewModel.loadProjects) {
                     Label(viewModel.isLoading ? "Loading..." : "Load projects", systemImage: "arrow.down.circle")
                 }
                 .disabled(viewModel.isLoading)
                 .buttonStyle(.borderedProminent)
-            }
 
-            Text(viewModel.statusMessage)
-                .foregroundStyle(.secondary)
-                .font(.system(size: 14))
+                Spacer()
+
+                Text(viewModel.statusMessage)
+                    .foregroundStyle(.secondary)
+                    .font(.system(size: 13))
+            }
 
             List(viewModel.projects) { project in
                 HStack {
@@ -129,8 +181,31 @@ struct ContentView: View {
                     .buttonStyle(.bordered)
                 }
             }
-            .frame(maxHeight: .infinity)
+            .frame(maxHeight: 280)
+
+            Divider()
+
+            HStack(spacing: 12) {
+                TextField("Scheme name to build", text: $viewModel.schemeText)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(maxWidth: 300)
+
+                Button("Build on Simulator") {
+                    viewModel.buildLastOpenedProject()
+                }
+                .buttonStyle(.borderedProminent)
+
+                Spacer()
+
+                VStack(alignment: .leading) {
+                    Text("Tip: vul eerst de scheme-naam in (zoals \"App\") nadat je het project hebt geopend in Xcode.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            Spacer()
         }
-        .padding(24)
+        .padding(20)
     }
 }
